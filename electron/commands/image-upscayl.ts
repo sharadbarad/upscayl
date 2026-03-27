@@ -22,6 +22,11 @@ import getDirectoryFromPath from "../../common/get-directory-from-path";
 import { MODELS } from "../../common/models-list";
 import { getPlatform } from "../utils/get-device-specs";
 import { copyMetadata } from "../utils/copy-metadata";
+import {
+  getFileHash,
+  readUpscaleCacheMetadata,
+  writeUpscaleCacheMetadata,
+} from "../utils/upscale-cache";
 
 const imageUpscayl = async (event, payload: ImageUpscaylPayload) => {
   const mainWindow = getMainWindow();
@@ -78,108 +83,132 @@ const imageUpscayl = async (event, payload: ImageUpscaylPayload) => {
 
   // UPSCALE
   if (fs.existsSync(outFile) && !overwrite) {
-    // If already upscayled, just output that file
-    logit("✅ Already upscayled at: ", outFile);
-    mainWindow.webContents.send(ELECTRON_COMMANDS.UPSCAYL_DONE, outFile);
-  } else {
-    logit(
-      "✅ Upscayl Variables: ",
-      JSON.stringify({
-        model,
-        gpuId,
-        saveImageAs,
-        inputDir,
-        fileNameWithExt,
-        outputDir,
-        outFile,
-        fileName,
-        scale,
-        compression,
-        customWidth,
-        useCustomWidth,
-        tileSize,
-      }),
-    );
-    const upscayl = spawnUpscayl(
-      getSingleImageArguments({
-        inputDir: decodeURIComponent(inputDir),
-        fileNameWithExt: decodeURIComponent(fileNameWithExt),
-        outFile,
-        modelsPath: isDefaultModel
-          ? modelsPath
-          : (savedCustomModelsPath ?? modelsPath),
-        model,
-        scale,
-        gpuId,
-        saveImageAs,
-        customWidth,
-        compression,
-        tileSize,
-        ttaMode,
-      }),
-      logit,
-    );
+    let shouldUseCachedUpscale = false;
 
-    setChildProcesses(upscayl);
+    try {
+      const sourceImageHash = await getFileHash(imagePath);
+      const existingCacheMetadata = readUpscaleCacheMetadata(outFile);
 
-    setStopped(false);
-    let failed = false;
+      shouldUseCachedUpscale =
+        existingCacheMetadata?.sourceImagePath === imagePath &&
+        existingCacheMetadata?.sourceImageHash === sourceImageHash;
+    } catch (error) {
+      logit("⚠️ Failed to validate cache metadata. Regenerating output.", error);
+    }
 
-    const onData = (data: string) => {
-      logit(data.toString());
-      mainWindow.setProgressBar(parseFloat(data.slice(0, data.length)) / 100);
-      data = data.toString();
-      mainWindow.webContents.send(
-        ELECTRON_COMMANDS.UPSCAYL_PROGRESS,
-        data.toString(),
-      );
-      if (data.includes("Error") || data.includes("failed")) {
-        upscayl.kill();
-        failed = true;
-        onError(data);
-      } else if (data.includes("Resizing")) {
-        mainWindow.webContents.send(ELECTRON_COMMANDS.SCALING_AND_CONVERTING);
-      }
-    };
-    const onError = (data) => {
-      if (!mainWindow) return;
-      mainWindow.setProgressBar(-1);
-      mainWindow.webContents.send(
-        ELECTRON_COMMANDS.UPSCAYL_ERROR,
-        data.toString(),
-      );
-      failed = true;
-      upscayl.kill();
+    if (shouldUseCachedUpscale) {
+      logit("✅ Already upscayled at: ", outFile);
+      mainWindow.webContents.send(ELECTRON_COMMANDS.UPSCAYL_DONE, outFile);
       return;
-    };
-    const onClose = async () => {
-      if (!failed && !stopped) {
-        logit("💯 Done upscaling");
-        // Free up memory
-        upscayl.kill();
-        mainWindow.setProgressBar(-1);
-        if (payload.copyMetadata) {
-          logit("🏷️ Copying metadata...");
-          try {
-            await copyMetadata(imagePath, outFile);
-            logit("✅ Metadata copied to: ", outFile);
-          } catch (error) {
-            logit("❌ Error copying metadata: ", error);
-            mainWindow.webContents.send(
-              ELECTRON_COMMANDS.METADATA_ERROR,
-              error,
-            );
-          }
-        }
-        mainWindow.webContents.send(ELECTRON_COMMANDS.UPSCAYL_DONE, outFile);
-        showNotification("Upscayl", "Image upscayled successfully!");
-      }
-    };
+    }
 
-    upscayl.process.stderr.on("data", onData);
-    upscayl.process.on("error", onError);
-    upscayl.process.on("close", onClose);
+    logit("♻️ Existing output is stale. Re-upscaling image.");
   }
+
+  logit(
+    "✅ Upscayl Variables: ",
+    JSON.stringify({
+      model,
+      gpuId,
+      saveImageAs,
+      inputDir,
+      fileNameWithExt,
+      outputDir,
+      outFile,
+      fileName,
+      scale,
+      compression,
+      customWidth,
+      useCustomWidth,
+      tileSize,
+    }),
+  );
+  const upscayl = spawnUpscayl(
+    getSingleImageArguments({
+      inputDir: decodeURIComponent(inputDir),
+      fileNameWithExt: decodeURIComponent(fileNameWithExt),
+      outFile,
+      modelsPath: isDefaultModel ? modelsPath : (savedCustomModelsPath ?? modelsPath),
+      model,
+      scale,
+      gpuId,
+      saveImageAs,
+      customWidth,
+      compression,
+      tileSize,
+      ttaMode,
+    }),
+    logit,
+  );
+
+  setChildProcesses(upscayl);
+
+  setStopped(false);
+  let failed = false;
+
+  const onData = (data: string) => {
+    logit(data.toString());
+    mainWindow.setProgressBar(parseFloat(data.slice(0, data.length)) / 100);
+    data = data.toString();
+    mainWindow.webContents.send(
+      ELECTRON_COMMANDS.UPSCAYL_PROGRESS,
+      data.toString(),
+    );
+    if (data.includes("Error") || data.includes("failed")) {
+      upscayl.kill();
+      failed = true;
+      onError(data);
+    } else if (data.includes("Resizing")) {
+      mainWindow.webContents.send(ELECTRON_COMMANDS.SCALING_AND_CONVERTING);
+    }
+  };
+  const onError = (data) => {
+    if (!mainWindow) return;
+    mainWindow.setProgressBar(-1);
+    mainWindow.webContents.send(
+      ELECTRON_COMMANDS.UPSCAYL_ERROR,
+      data.toString(),
+    );
+    failed = true;
+    upscayl.kill();
+    return;
+  };
+  const onClose = async () => {
+    if (!failed && !stopped) {
+      logit("💯 Done upscaling");
+      // Free up memory
+      upscayl.kill();
+      mainWindow.setProgressBar(-1);
+      if (payload.copyMetadata) {
+        logit("🏷️ Copying metadata...");
+        try {
+          await copyMetadata(imagePath, outFile);
+          logit("✅ Metadata copied to: ", outFile);
+        } catch (error) {
+          logit("❌ Error copying metadata: ", error);
+          mainWindow.webContents.send(
+            ELECTRON_COMMANDS.METADATA_ERROR,
+            error,
+          );
+        }
+      }
+      try {
+        const sourceImageHash = await getFileHash(imagePath);
+        writeUpscaleCacheMetadata(outFile, {
+          sourceImagePath: imagePath,
+          sourceImageHash,
+        });
+      } catch (error) {
+        logit("⚠️ Failed to write upscale cache metadata: ", error);
+      }
+      mainWindow.webContents.send(ELECTRON_COMMANDS.UPSCAYL_DONE, outFile);
+      showNotification("Upscayl", "Image upscayled successfully!");
+    }
+  };
+
+  upscayl.process.stderr.on("data", onData);
+  upscayl.process.on("error", onError);
+  upscayl.process.on("close", onClose);
 };
 
 export default imageUpscayl;
